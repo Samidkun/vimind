@@ -1,6 +1,6 @@
 import { useNavigate, useLocation } from "react-router-dom";
-import { useState, useEffect, useMemo } from "react";
-import { getQuestions, diagnose, getLevels } from "../services/api";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { getQuestions, diagnose } from "../services/api";
 import { supabase } from "../services/supabaseClient";
 import "../css/DetectionQuestionCSS.css";
 
@@ -15,7 +15,11 @@ function saveDraft(data) {
 function loadDraft() {
   try {
     const raw = localStorage.getItem(LS_DRAFT_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    // Jangan restore draft yang sudah selesai (completed)
+    if (parsed.completed) return null;
+    return parsed;
   } catch (_) { return null; }
 }
 function clearDraft() {
@@ -42,6 +46,7 @@ export default function Detection() {
 
   const navigate = useNavigate();
   const location = useLocation();
+  const initDone = useRef(false); // Cegah auto-save selama init
 
   const [questions, setQuestions]               = useState([]);
   const [selectedAnswers, setSelectedAnswers]   = useState({});
@@ -53,7 +58,6 @@ export default function Detection() {
   const [historyDiseaseID, setHistoryDiseaseID] = useState(0);
   const [isOffline, setIsOffline]               = useState(!navigator.onLine);
   const [retryAnswers, setRetryAnswers]         = useState(null);
-  const [cfLevels, setCfLevels]                 = useState(null);
 
   // ============================================================
   // Group questions by disease_id & batasi maksimal 5 soal per halaman
@@ -124,6 +128,10 @@ export default function Detection() {
     let ignore = false;
 
     const init = async () => {
+      // Reset questions dulu agar tidak ada render dengan stale data
+      setQuestions([]);
+      setSelectedAnswers({});
+
       try {
         const { data: { session } } = await supabase.auth.getSession();
         if (ignore) return;
@@ -136,134 +144,95 @@ export default function Detection() {
 
         const isGuest = !email;
         const forceNewTest = location.state?.forceNewTest;
+        // sessionStorage hilang saat tab ditutup, tapi bertahan saat refresh
+        const isOngoingSession = sessionStorage.getItem("quiz_active") === "true";
 
-        // ── GUEST USER: Selalu mulai tes baru, jangan pakai draft ──
+        // Helper: mulai tes bersih
+        const startFresh = async () => {
+          clearDraft();
+          setCurrentPage(0);
+          setIsRefinedMode(false);
+          setHistoryDiseaseID(0);
+          sessionStorage.setItem("quiz_active", "true");
+
+          const res = await getQuestions("all");
+          if (ignore) return;
+          const qs = res.data?.questions || res.data || [];
+          if (!ignore) setQuestions(qs);
+        };
+
+        // ── GUEST USER: Selalu mulai tes baru ──
         if (isGuest) {
-          clearDraft();
-          setSelectedAnswers({});
-          setCurrentPage(0);
-          setIsRefinedMode(false);
-          setHistoryDiseaseID(0);
-
-          const res = await getQuestions("all");
-          if (ignore) return;
-          const qs = res.data?.questions || res.data || [];
-          if (!ignore) setQuestions(qs);
-
-          // Fetch CF levels
-          try {
-            const levelsRes = await getLevels();
-            if (levelsRes.data && !ignore) {
-              const levelsMap = {};
-              levelsRes.data.forEach((lvl) => { levelsMap[lvl.level_id] = lvl.cf_value; });
-              setCfLevels(levelsMap);
-            }
-          } catch { if (!ignore) console.warn("Failed to fetch CF levels, using fallback"); }
-
-          if (!ignore) setLoading(false);
+          await startFresh();
           return;
         }
 
-        // ── LOGGED-IN USER: "Deteksi Penyakit Baru" ──
-        if (forceNewTest) {
-          clearDraft();
-          setSelectedAnswers({});
-          setCurrentPage(0);
-          setIsRefinedMode(false);
-          setHistoryDiseaseID(0);
-
-          const res = await getQuestions("all");
-          if (ignore) return;
-          const qs = res.data?.questions || res.data || [];
-          if (!ignore) setQuestions(qs);
-
-          // Fetch CF levels
-          try {
-            const levelsRes = await getLevels();
-            if (levelsRes.data && !ignore) {
-              const levelsMap = {};
-              levelsRes.data.forEach((lvl) => { levelsMap[lvl.level_id] = lvl.cf_value; });
-              setCfLevels(levelsMap);
-            }
-          } catch { if (!ignore) console.warn("Failed to fetch CF levels, using fallback"); }
-
-          if (!ignore) setLoading(false);
+        // ── LOGGED-IN + Eksplisit "Deteksi Penyakit Baru" ──
+        if (forceNewTest === true) {
+          await startFresh();
           return;
         }
 
-        // ── LOGGED-IN USER: "Lanjutkan Kondisi Sebelumnya" ──
-        // Coba pulihkan draft dulu
-        const draft = loadDraft();
-        if (draft && draft.questions?.length > 0) {
-          setQuestions(draft.questions);
-          setSelectedAnswers(draft.selectedAnswers || {});
-          setCurrentPage(draft.currentPage || 0);
-          setIsRefinedMode(draft.isRefinedMode || false);
-          setHistoryDiseaseID(draft.historyDiseaseID || 0);
+        // ── LOGGED-IN + "Lanjutkan Kondisi" ATAU refresh mid-test ──
+        if (forceNewTest === false || (forceNewTest === undefined && isOngoingSession)) {
+          const draft = loadDraft();
+          if (draft && draft.questions?.length > 0) {
+            setQuestions(draft.questions);
+            setSelectedAnswers(draft.selectedAnswers || {});
+            setCurrentPage(draft.currentPage || 0);
+            setIsRefinedMode(draft.isRefinedMode || false);
+            setHistoryDiseaseID(draft.historyDiseaseID || 0);
+            sessionStorage.setItem("quiz_active", "true");
+            return;
+          }
 
-          // Tetap fetch CF levels
+          // Draft kosong → muat soal refined dari history
+          let qs = [];
           try {
-            const levelsRes = await getLevels();
-            if (levelsRes.data && !ignore) {
-              const levelsMap = {};
-              levelsRes.data.forEach((lvl) => { levelsMap[lvl.level_id] = lvl.cf_value; });
-              setCfLevels(levelsMap);
-            }
-          } catch { if (!ignore) console.warn("Failed to fetch CF levels, using fallback"); }
-
-          if (!ignore) setLoading(false);
-          return;
-        }
-
-        // Nggak ada draft → muat soal refined dari history
-        let qs = [];
-        try {
-          const response = await getQuestions("refined", [], email);
-          if (ignore) return;
-
-          const { questions: refinedQs, is_refined } = response.data;
-
-          if (refinedQs && refinedQs.length > 0) {
-            qs = refinedQs;
-            if (is_refined) {
-              setIsRefinedMode(true);
-              if (response.data.history_disease_id > 0) {
-                setHistoryDiseaseID(response.data.history_disease_id);
+            const response = await getQuestions("refined", [], email);
+            if (ignore) return;
+            const { questions: refinedQs, is_refined } = response.data;
+            if (refinedQs && refinedQs.length > 0) {
+              qs = refinedQs;
+              if (is_refined) {
+                setIsRefinedMode(true);
+                if (response.data.history_disease_id > 0) {
+                  setHistoryDiseaseID(response.data.history_disease_id);
+                }
               }
+            } else {
+              throw new Error("No refined questions");
             }
-          } else {
-            throw new Error("No refined questions, using all");
+          } catch {
+            const fallback = await getQuestions("all");
+            if (ignore) return;
+            qs = fallback.data?.questions || fallback.data || [];
           }
-        } catch {
-          const fallback = await getQuestions("all");
-          if (ignore) return;
-          qs = fallback.data?.questions || fallback.data || [];
+          sessionStorage.setItem("quiz_active", "true");
+          if (!ignore) setQuestions(qs);
+          return;
         }
 
-        // Fetch CF levels
-        try {
-          const levelsRes = await getLevels();
-          if (levelsRes.data && !ignore) {
-            const levelsMap = {};
-            levelsRes.data.forEach((lvl) => { levelsMap[lvl.level_id] = lvl.cf_value; });
-            setCfLevels(levelsMap);
-          }
-        } catch { if (!ignore) console.warn("Failed to fetch CF levels, using fallback"); }
-
-        if (!ignore) setQuestions(qs);
+        // ── LOGGED-IN + akses langsung tanpa state, tanpa session aktif ──
+        await startFresh();
       } catch (err) {
         if (!ignore) console.error("Initialization failed:", err);
       } finally {
-        if (!ignore) setLoading(false);
+        if (!ignore) {
+          setLoading(false);
+          initDone.current = true; // Auto-save sekarang boleh jalan
+        }
       }
     };
 
+    initDone.current = false;
     init();
     return () => { ignore = true; };
   }, [location.state]);
 
-  // Simpan draft setiap kali state penting berubah
+  // Simpan draft setiap kali state penting berubah (HANYA setelah init selesai)
   useEffect(() => {
+    if (!initDone.current) return;
     if (questions.length > 0) {
       saveDraft({ questions, selectedAnswers, currentPage, isRefinedMode, historyDiseaseID });
     }
@@ -287,11 +256,18 @@ export default function Detection() {
     if (!isCurrentPageComplete) return;
 
     if (currentPage >= totalPages - 1) {
-      // Fallback weights if DB fetch failed
-      const weights = cfLevels || { 1: 0.855, 2: 0.555, 3: 0.305, 4: 0.15 };
+      // Bobot CF User (Certainty Factor metodologi standar)
+      // Opsi 1 (Setuju)         → 1.0  = User yakin punya gejala ini
+      // Opsi 2 (Cukup Setuju)   → 0.6  = User cukup merasakan
+      // Opsi 3 (Kurang Setuju)  → 0.2  = User sedikit merasakan
+      // Opsi 4 (Tidak Setuju)   → 0.0  = User TIDAK punya gejala (HARUS NOL!)
+      //
+      // PENTING: level_category di DB (0.855/0.555/0.305/0.15) adalah
+      // klasifikasi LEVEL DIAGNOSIS (output), BUKAN bobot jawaban user!
+      const weights = { 1: 1.0, 2: 0.6, 3: 0.2, 4: 0.0 };
       const finalAnswers = questions.map((q) => ({
         symptom_id: q.id,
-        value: weights[selectedAnswers[q.id]] || 0,
+        value: weights[selectedAnswers[q.id]] ?? 0,
         disease_id: q.disease_id || 0,
       }));
       await finalizeDiagnosis(finalAnswers);
@@ -328,6 +304,7 @@ export default function Detection() {
       }
 
       clearDraft();
+      sessionStorage.removeItem("quiz_active");
       setRetryAnswers(null);
       navigate("/selesai", { state: { diagnosis: result.data, isGuest: !userEmail } });
     } catch (err) {
