@@ -112,11 +112,8 @@ export default function Detection() {
         const { data: { session } } = await supabase.auth.getSession();
         if (ignore) return;
 
-        let email = "";
-        if (session?.user) {
-          email = session.user.email;
-          setUserEmail(email);
-        }
+        let email = session?.user?.email || "";
+        if (email) setUserEmail(email);
 
         // Guest session ID: buat baru atau pakai yang sudah ada di sessionStorage
         let sid = sessionStorage.getItem("guest_session_id") || "";
@@ -127,86 +124,61 @@ export default function Detection() {
         setSessionId(sid);
 
         const forceNewTest = location.state?.forceNewTest;
-        const cacheKey = { email, sid }; // salah satu akan dipakai
+
+        // Helper untuk memulihkan sesi dari backend cache
+        const tryRestoreCache = async () => {
+          try {
+            const cached = await getTestSession(email, sid);
+            if (cached.data?.exists && cached.data.answers && Object.keys(cached.data.answers).length > 0) {
+              const res = await getQuestions("all");
+              if (!ignore) {
+                setQuestions(res.data?.questions || res.data || []);
+                setSelectedAnswers(cached.data.answers);
+                setCurrentPage(cached.data.current_page || 0);
+              }
+              return true; // Berhasil di-restore
+            }
+          } catch {}
+          return false;
+        };
 
         // ── "Deteksi Penyakit Baru" → hapus cache, mulai fresh ──
         if (forceNewTest === true) {
           try { await deleteTestSession(email, sid); } catch {}
           if (!email) {
-            // Guest: buat session ID baru untuk tes baru
-            const newSid = crypto.randomUUID();
-            sessionStorage.setItem("guest_session_id", newSid);
-            setSessionId(newSid);
+            // Refresh guest session ID untuk tes yang baru
+            sid = crypto.randomUUID();
+            sessionStorage.setItem("guest_session_id", sid);
+            setSessionId(sid);
           }
-        }
-
+        } 
         // ── Refresh / URL langsung → cek backend cache ──
-        if (forceNewTest === undefined) {
-          try {
-            const cached = await getTestSession(email, sid);
-            if (cached.data?.exists && cached.data.answers && Object.keys(cached.data.answers).length > 0) {
-              const res = await getQuestions("all");
-              if (ignore) return;
-              const qs = res.data?.questions || res.data || [];
-              if (!ignore) {
-                setQuestions(qs);
-                setSelectedAnswers(cached.data.answers);
-                setCurrentPage(cached.data.current_page || 0);
-              }
-              return;
-            }
-          } catch { /* Nggak ada cache */ }
-        }
-
-        // ── "Lanjutkan Kondisi" (forceNewTest === false, logged-in) ──
-        if (email && forceNewTest === false) {
-          // Cek backend cache dulu
-          try {
-            const cached = await getTestSession(email, sid);
-            if (cached.data?.exists && cached.data.answers && Object.keys(cached.data.answers).length > 0) {
-              const res = await getQuestions("all");
-              if (ignore) return;
-              const qs = res.data?.questions || res.data || [];
-              if (!ignore) {
-                setQuestions(qs);
-                setSelectedAnswers(cached.data.answers);
-                setCurrentPage(cached.data.current_page || 0);
-              }
-              return;
-            }
-          } catch {}
+        else if (forceNewTest === undefined) {
+          if (await tryRestoreCache()) return;
+        } 
+        // ── "Lanjutkan Kondisi" (logged-in, forceNewTest = false) ──
+        else if (email && forceNewTest === false) {
+          if (await tryRestoreCache()) return;
 
           // Nggak ada cache → soal refined dari history
-          let qs = [];
           try {
             const response = await getQuestions("refined", [], email);
             if (ignore) return;
-            const { questions: refinedQs, is_refined } = response.data;
-            if (refinedQs && refinedQs.length > 0) {
-              qs = refinedQs;
+            const { questions: refinedQs, is_refined, history_disease_id } = response.data;
+            if (refinedQs?.length > 0) {
+              setQuestions(refinedQs);
               if (is_refined) {
                 setIsRefinedMode(true);
-                if (response.data.history_disease_id > 0) {
-                  setHistoryDiseaseID(response.data.history_disease_id);
-                }
+                if (history_disease_id > 0) setHistoryDiseaseID(history_disease_id);
               }
-            } else {
-              throw new Error("No refined questions");
+              return;
             }
-          } catch {
-            const fallback = await getQuestions("all");
-            if (ignore) return;
-            qs = fallback.data?.questions || fallback.data || [];
-          }
-          if (!ignore) setQuestions(qs);
-          return;
+          } catch {} // Jika error, lanjut ke fallback "all" di bawah
         }
 
-        // ── Default (Guest fresh / Deteksi Baru) ──
+        // ── Default (Guest fresh / Deteksi Baru / Fallback) ──
         const res = await getQuestions("all");
-        if (ignore) return;
-        const qs = res.data?.questions || res.data || [];
-        if (!ignore) setQuestions(qs);
+        if (!ignore) setQuestions(res.data?.questions || res.data || []);
       } catch (err) {
         if (!ignore) console.error("Initialization failed:", err);
       } finally {
