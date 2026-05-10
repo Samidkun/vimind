@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -18,7 +19,9 @@ import (
 
 func main() {
 	// 1. Initialization
+	// Jangan biarkan aplikasi panic kalau file .env gak ada (di Cloud Run emang gak ada)
 	config.LoadEnv()
+
 	db := config.ConnectDB()
 	defer db.Close()
 
@@ -62,5 +65,12 @@ func main() {
 	routes.RegisterRoutes(app, handler)
 
 	// 5. Start Server
-	log.Fatal(app.Listen(":8080"))
+	// AMBIL PORT DARI ENV (WAJIB BUAT CLOUD RUN)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Default ke 8080 kalau running lokal
+	}
+
+	log.Printf("Server starting on port %s", port)
+	log.Fatal(app.Listen(":" + port))
 }
